@@ -1,7 +1,6 @@
 package main
 
 import (
-  "errors"
   "fmt"
   "os"
   "strconv"
@@ -11,191 +10,400 @@ import (
   "github.com/charmbracelet/huh"
   "github.com/charmbracelet/huh/spinner"
   "github.com/charmbracelet/lipgloss"
-  xstrings "github.com/charmbracelet/x/exp/strings"
 )
 
-type Spice int
+// Expense is a single recurring monthly fixed cost.
+type Expense struct {
+  Name   string
+  Amount float64
+}
 
+// Budget holds everything we need to advise on, plus the computed plan.
+type Budget struct {
+  Income   float64
+  Expenses []Expense
+}
+
+// The classic 50/30/20 rule: 50% needs, 30% wants, 20% savings.
 const (
-  Mild Spice = iota + 1
-  Medium
-  Hot
+  needsShare   = 0.50
+  wantsShare   = 0.30
+  savingsShare = 0.20
 )
-
-func (s Spice) String() string {
-  switch s {
-  case Mild:
-    return "Mild "
-  case Medium:
-    return "Medium-Spicy "
-  case Hot:
-    return "Spicy-Hot "
-  default:
-    return ""
-  }
-}
-
-type Order struct {
-  Burger       Burger
-  Side         string
-  Name         string
-  Instructions string
-  Discount     bool
-}
-
-type Burger struct {
-  Type     string
-  Toppings []string
-  Spice    Spice
-}
 
 func main() {
-  var burger Burger
-  var order = Order{Burger: burger}
-
-  // Should we run in accessible mode?
   accessible, _ := strconv.ParseBool(os.Getenv("ACCESSIBLE"))
 
-  form := huh.NewForm(
-    huh.NewGroup(huh.NewNote().
-      Title("Charmburger").
-      Description("Welcome to _Charmburger™_.\n\nHow may we take your order?\n\n").
-      Next(true).
-      NextLabel("Next"),
-    ),
+  var incomeStr string
 
-    // Choose a burger.
-    // We'll need to know what topping to add too.
+  // Intro + net monthly income.
+  intro := huh.NewForm(
     huh.NewGroup(
-      huh.NewSelect[string]().
-	Options(huh.NewOptions("Charmburger Classic", "Chickwich", "Fishburger", "Charmpossible™ Burger")...).
-	Title("Choose your burger").
-	Description("At Charm we truly have a burger for everyone.").
-	Validate(func(t string) error {
-	  if t == "Fishburger" {
-	    return fmt.Errorf("no fish today, sorry")
-	  }
-	  return nil
-	}).
-	Value(&order.Burger.Type),
+      huh.NewNote().
+        Title("Charm Budget").
+        Description("Welcome to _Charm Budget_ 💰\n\nTell me about your money and I'll suggest\nhow much to save, and how much you can spend freely.\n\nAll amounts are in Brazilian Reais (R$).\n").
+        Next(true).
+        NextLabel("Let's go"),
 
-      huh.NewMultiSelect[string]().
-	Title("Toppings").
-	Description("Choose up to 4.").
-	Options(
-	  huh.NewOption("Lettuce", "Lettuce").Selected(true),
-	  huh.NewOption("Tomatoes", "Tomatoes").Selected(true),
-	  huh.NewOption("Charm Sauce", "Charm Sauce"),
-	  huh.NewOption("Jalapeños", "Jalapeños"),
-	  huh.NewOption("Cheese", "Cheese"),
-	  huh.NewOption("Vegan Cheese", "Vegan Cheese"),
-	  huh.NewOption("Nutella", "Nutella"),
-	).
-	Validate(func(t []string) error {
-	  if len(t) <= 0 {
-	    return fmt.Errorf("at least one topping is required")
-	  }
-	  return nil
-	}).
-	Value(&order.Burger.Toppings).
-	Filterable(true).
-	Limit(4),
-    ),
-
-    // Prompt for toppings and special instructions.
-    // The customer can ask for up to 4 toppings.
-    huh.NewGroup(
-      huh.NewSelect[Spice]().
-	Title("Spice level").
-	Options(
-	  huh.NewOption("Mild", Mild).Selected(true),
-	  huh.NewOption("Medium", Medium),
-	  huh.NewOption("Hot", Hot),
-	).
-	Value(&order.Burger.Spice),
-
-    huh.NewSelect[string]().
-	Options(huh.NewOptions("Fries", "Disco Fries", "R&B Fries", "Carrots")...).
-	Value(&order.Side).
-	Title("Sides").
-	Description("You get one free side with this order."),
-    ),
-
-    // Gather final details for the order.
-    huh.NewGroup(
       huh.NewInput().
-	Value(&order.Name).
-	Title("What's your name?").
-	Placeholder("Margaret Thatcher").
-	Validate(func(s string) error {
-	  if s == "Frank" {
-	    return errors.New("no franks, sorry")
-	  }
-	  return nil
-	}).
-	Description("For when your order is ready."),
-
-      huh.NewText().
-	Value(&order.Instructions).
-	Placeholder("Just put it in the mailbox please").
-	Title("Special Instructions").
-	Description("Anything we should know?").
-	CharLimit(400).
-	Lines(5),
-
-      huh.NewConfirm().
-	Title("Would you like 15% off?").
-	Value(&order.Discount).
-	Affirmative("Yes!").
-	Negative("No."),
+        Title("Net monthly income").
+        Description("What you actually take home each month, after taxes.").
+        Placeholder("3500,00").
+        Prompt("R$ ").
+        Validate(validatePositiveAmount).
+        Value(&incomeStr),
     ),
   ).WithAccessible(accessible)
 
-  err := form.Run()
-
-  if err != nil {
+  if err := intro.Run(); err != nil {
     fmt.Println("Uh oh:", err)
     os.Exit(1)
   }
 
-  prepareBurger := func() {
-    time.Sleep(2 * time.Second)
+  budget := Budget{Income: parseAmount(incomeStr)}
+
+  // Loop to collect any number of fixed expenses.
+  for {
+    var name, amountStr string
+    var addAnother bool
+
+    expenseForm := huh.NewForm(
+      huh.NewGroup(
+        huh.NewInput().
+          Title("Fixed expense name").
+          Description("A recurring monthly cost: rent, energy, water, transport...").
+          Placeholder("Rent").
+          Validate(validateNonEmpty).
+          Value(&name),
+
+        huh.NewInput().
+          Title("Monthly amount").
+          Prompt("R$ ").
+          Placeholder("1200,00").
+          Validate(validatePositiveAmount).
+          Value(&amountStr),
+
+        huh.NewConfirm().
+          Title("Add another expense?").
+          Affirmative("Yes, add more").
+          Negative("No, I'm done").
+          Value(&addAnother),
+      ),
+    ).WithAccessible(accessible)
+
+    if err := expenseForm.Run(); err != nil {
+      fmt.Println("Uh oh:", err)
+      os.Exit(1)
+    }
+
+    budget.Expenses = append(budget.Expenses, Expense{
+      Name:   strings.TrimSpace(name),
+      Amount: parseAmount(amountStr),
+    })
+
+    if !addAnother {
+      break
+    }
   }
 
-  _ = spinner.New().Title("Preparing your burger...").Accessible(accessible).Action(prepareBurger).Run()
+  _ = spinner.New().
+    Title("Crunching your numbers...").
+    Accessible(accessible).
+    Action(func() { time.Sleep(1500 * time.Millisecond) }).
+    Run()
 
-  // Print order summary.
-  {
-    var sb strings.Builder
-    keyword := func(s string) string {
-      return lipgloss.NewStyle().Foreground(lipgloss.Color("212")).Render(s)
-    }
-    fmt.Fprintf(&sb,
-      "%s\n\nOne %s%s, topped with %s with %s on the side.",
-      lipgloss.NewStyle().Bold(true).Render("BURGER RECEIPT"),
-      keyword(order.Burger.Spice.String()),
-      keyword(order.Burger.Type),
-      keyword(xstrings.EnglishJoin(order.Burger.Toppings, true)),
-      keyword(order.Side),
-    )
+  fmt.Println(renderReport(budget))
+}
 
-    name := order.Name
-    if name != "" {
-      name = ", " + name
-    }
-    fmt.Fprintf(&sb, "\n\nThanks for your order%s!", name)
+// --- Budget engine ---------------------------------------------------------
 
-    if order.Discount {
-      fmt.Fprint(&sb, "\n\nEnjoy 15% off.")
+// Plan is the advice we derive from a Budget.
+type Plan struct {
+  TotalFixed        float64
+  Leftover          float64 // income minus fixed costs
+  NeedsPct          float64 // fixed costs as a share of income
+  RecommendedSaving float64 // suggested amount to save each month
+  FreeToSpend       float64 // suggested amount for guilt-free spending
+  IdealNeeds        float64 // 50% of income
+  IdealWants        float64 // 30% of income
+  IdealSavings      float64 // 20% of income
+  Warnings          []string
+  Tips              []string
+}
+
+func analyze(b Budget) Plan {
+  var total float64
+  for _, e := range b.Expenses {
+    total += e.Amount
+  }
+
+  p := Plan{
+    TotalFixed:   total,
+    Leftover:     b.Income - total,
+    IdealNeeds:   b.Income * needsShare,
+    IdealWants:   b.Income * wantsShare,
+    IdealSavings: b.Income * savingsShare,
+  }
+  if b.Income > 0 {
+    p.NeedsPct = total / b.Income
+  }
+
+  switch {
+  case p.Leftover <= 0:
+    // Fixed costs meet or exceed income: a real deficit.
+    p.RecommendedSaving = 0
+    p.FreeToSpend = 0
+    p.Warnings = append(p.Warnings, fmt.Sprintf(
+      "Your fixed expenses (%s) meet or exceed your income. You have nothing left over — this is a deficit.",
+      formatBRL(total)))
+    p.Tips = append(p.Tips,
+      "Focus first on cutting fixed costs or raising income before thinking about savings.")
+
+  case p.Leftover >= p.IdealSavings:
+    // Comfortable: you can hit the 20% savings target.
+    p.RecommendedSaving = p.IdealSavings
+    // Anything beyond needs + target savings is yours to spend freely,
+    // but nudge splitting a generous surplus.
+    surplus := p.Leftover - p.IdealSavings
+    if surplus > p.IdealWants {
+      // Lots of room: bank half of the excess above the wants budget.
+      extra := (surplus - p.IdealWants) / 2
+      p.RecommendedSaving += extra
+      p.FreeToSpend = p.Leftover - p.RecommendedSaving
+      p.Tips = append(p.Tips, fmt.Sprintf(
+        "You have plenty of room. I bumped your savings by %s above the 20%% target — consider investing it.",
+        formatBRL(extra)))
+    } else {
+      p.FreeToSpend = surplus
     }
 
-    fmt.Println(
-      lipgloss.NewStyle().
-	Width(40).
-	BorderStyle(lipgloss.RoundedBorder()).
-	BorderForeground(lipgloss.Color("63")).
-	Padding(1, 2).
-	Render(sb.String()),
-      )
+  default:
+    // Tight: can't reach 20%, so save half of what's left, spend the rest.
+    p.RecommendedSaving = p.Leftover / 2
+    p.FreeToSpend = p.Leftover - p.RecommendedSaving
+    p.Warnings = append(p.Warnings, fmt.Sprintf(
+      "After fixed costs you only have %s left, less than the ideal 20%% savings (%s).",
+      formatBRL(p.Leftover), formatBRL(p.IdealSavings)))
+    p.Tips = append(p.Tips,
+      "I split the remainder in half: some savings, some free spending. Trimming fixed costs would let you save more.")
+  }
+
+  // Warn when fixed costs are above the healthy 50% of income.
+  if p.NeedsPct > needsShare {
+    p.Warnings = append(p.Warnings, fmt.Sprintf(
+      "Your fixed costs are %.0f%% of income — above the recommended 50%% ceiling.",
+      p.NeedsPct*100))
+  } else if p.TotalFixed > 0 && p.NeedsPct <= needsShare-0.15 {
+    p.Tips = append(p.Tips, fmt.Sprintf(
+      "Nicely done — fixed costs are only %.0f%% of income, well under the 50%% guideline.",
+      p.NeedsPct*100))
+  }
+
+  // Standing best-practice tips (widely recommended in personal finance).
+  if p.TotalFixed > 0 && p.Leftover > 0 {
+    p.Tips = append(p.Tips, fmt.Sprintf(
+      "Build an emergency fund first: 3–6 months of fixed costs (%s–%s) in easy-access savings.",
+      formatBRL(p.TotalFixed*3), formatBRL(p.TotalFixed*6)))
+  }
+  if p.RecommendedSaving > 0 {
+    p.Tips = append(p.Tips,
+      "Automate it: move your savings out the day you're paid, before you can spend it.")
+  }
+
+  return p
+}
+
+// --- Rendering -------------------------------------------------------------
+
+var (
+  titleStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212"))
+  headingStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("99"))
+  moneyStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+  mutedStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+  warnStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+  tipStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("117"))
+  boxStyle     = lipgloss.NewStyle().
+      Width(52).
+      BorderStyle(lipgloss.RoundedBorder()).
+      BorderForeground(lipgloss.Color("63")).
+      Padding(1, 2)
+)
+
+func renderReport(b Budget) string {
+  p := analyze(b)
+  var sb strings.Builder
+
+  sb.WriteString(titleStyle.Render("YOUR MONTHLY BUDGET PLAN"))
+  sb.WriteString("\n\n")
+
+  line(&sb, "Net income", formatBRL(b.Income))
+  line(&sb, "Fixed expenses", formatBRL(p.TotalFixed))
+  line(&sb, "Left over", formatBRL(p.Leftover))
+
+  sb.WriteString("\n")
+  sb.WriteString(headingStyle.Render("Fixed expenses"))
+  sb.WriteString("\n")
+  if len(b.Expenses) == 0 {
+    sb.WriteString(mutedStyle.Render("  (none entered)"))
+    sb.WriteString("\n")
+  }
+  for _, e := range b.Expenses {
+    name := e.Name
+    if name == "" {
+      name = "Unnamed"
     }
+    line(&sb, "  "+name, formatBRL(e.Amount))
+  }
+
+  sb.WriteString("\n")
+  sb.WriteString(headingStyle.Render("My recommendation"))
+  sb.WriteString("\n")
+  line(&sb, "  Save each month", formatBRL(p.RecommendedSaving))
+  line(&sb, "  Free to spend", formatBRL(p.FreeToSpend))
+
+  // Visual split of income: needs / savings / free.
+  if bar := renderBar(p.TotalFixed, p.RecommendedSaving, p.FreeToSpend, b.Income); bar != "" {
+    sb.WriteString("\n")
+    sb.WriteString(bar)
+    sb.WriteString("\n")
+  }
+
+  sb.WriteString("\n")
+  sb.WriteString(mutedStyle.Render("Reference — the 50/30/20 rule:"))
+  sb.WriteString("\n")
+  line(&sb, mutedStyle.Render("  50% needs"), mutedStyle.Render(formatBRL(p.IdealNeeds)))
+  line(&sb, mutedStyle.Render("  30% wants"), mutedStyle.Render(formatBRL(p.IdealWants)))
+  line(&sb, mutedStyle.Render("  20% savings"), mutedStyle.Render(formatBRL(p.IdealSavings)))
+
+  for _, w := range p.Warnings {
+    sb.WriteString("\n")
+    sb.WriteString(warnStyle.Render("⚠ " + w))
+    sb.WriteString("\n")
+  }
+  for _, t := range p.Tips {
+    sb.WriteString("\n")
+    sb.WriteString(tipStyle.Render("💡 " + t))
+    sb.WriteString("\n")
+  }
+
+  return boxStyle.Render(sb.String())
+}
+
+// renderBar draws a proportional block bar of income split into
+// needs (fixed) / savings / free-to-spend, with a small legend.
+func renderBar(needs, savings, free, income float64) string {
+  const width = 44
+  if income <= 0 {
+    return ""
+  }
+  block := func(n int, color string) string {
+    if n <= 0 {
+      return ""
+    }
+    return lipgloss.NewStyle().Foreground(lipgloss.Color(color)).Render(strings.Repeat("█", n))
+  }
+
+  nNeeds := int(needs / income * width)
+  if nNeeds > width {
+    nNeeds = width
+  }
+  nSave := int(savings / income * width)
+  if nNeeds+nSave > width {
+    nSave = width - nNeeds
+  }
+  nFree := width - nNeeds - nSave
+
+  bar := block(nNeeds, "203") + block(nSave, "42") + block(nFree, "117")
+  legend := block(1, "203") + mutedStyle.Render(" needs   ") +
+    block(1, "42") + mutedStyle.Render(" savings   ") +
+    block(1, "117") + mutedStyle.Render(" free")
+  return bar + "\n" + legend
+}
+
+// line writes a label on the left and a right-aligned value.
+func line(sb *strings.Builder, label, value string) {
+  const width = 46
+  pad := width - lipgloss.Width(label) - lipgloss.Width(value)
+  if pad < 1 {
+    pad = 1
+  }
+  sb.WriteString(label)
+  sb.WriteString(strings.Repeat(" ", pad))
+  // Color plain money values green; already-styled values pass through.
+  if strings.HasPrefix(value, "R$") || strings.HasPrefix(value, "-R$") {
+    value = moneyStyle.Render(value)
+  }
+  sb.WriteString(value)
+  sb.WriteString("\n")
+}
+
+// --- Parsing & formatting --------------------------------------------------
+
+// parseAmount accepts "3500", "3.500,00", "3500.00" or "R$ 1.200,50".
+func parseAmount(s string) float64 {
+  s = strings.TrimSpace(s)
+  s = strings.NewReplacer("R$", "", " ", "").Replace(s)
+  if s == "" {
+    return 0
+  }
+  hasComma := strings.Contains(s, ",")
+  hasDot := strings.Contains(s, ".")
+  switch {
+  case hasComma && hasDot:
+    // pt-BR: dot is thousands, comma is decimal.
+    s = strings.ReplaceAll(s, ".", "")
+    s = strings.ReplaceAll(s, ",", ".")
+  case hasComma:
+    // Comma is the decimal separator.
+    s = strings.ReplaceAll(s, ",", ".")
+  }
+  v, err := strconv.ParseFloat(s, 64)
+  if err != nil {
+    return 0
+  }
+  return v
+}
+
+// formatBRL renders a value as e.g. "R$ 3.500,00".
+func formatBRL(v float64) string {
+  neg := v < 0
+  if neg {
+    v = -v
+  }
+  s := strconv.FormatFloat(v, 'f', 2, 64) // "3500.00"
+  intPart, dec, _ := strings.Cut(s, ".")
+
+  var grouped strings.Builder
+  n := len(intPart)
+  for i := 0; i < n; i++ {
+    if i > 0 && (n-i)%3 == 0 {
+      grouped.WriteByte('.')
+    }
+    grouped.WriteByte(intPart[i])
+  }
+
+  out := "R$ " + grouped.String() + "," + dec
+  if neg {
+    out = "-" + out
+  }
+  return out
+}
+
+// --- Validators ------------------------------------------------------------
+
+func validateNonEmpty(s string) error {
+  if strings.TrimSpace(s) == "" {
+    return fmt.Errorf("this can't be empty")
+  }
+  return nil
+}
+
+func validatePositiveAmount(s string) error {
+  if strings.TrimSpace(s) == "" {
+    return fmt.Errorf("please enter an amount")
+  }
+  if parseAmount(s) <= 0 {
+    return fmt.Errorf("enter a positive number, e.g. 1500 or 1.500,00")
+  }
+  return nil
 }
